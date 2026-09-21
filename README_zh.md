@@ -2,6 +2,11 @@
 
 本仓库是基于 DiffSynth-Studio 的 Wan2.2-TI2V-5B 世界模型训练/推理分支。
 
+本分支提供 [ORCA H2 + Sharpa 58D delta action 适配](examples/wanvideo/model_training/ORCA_DELTA.md)：
+使用原始目标位置减当前实际位置，零中心缩放，数据文件不移位；
+在原生训练加载器开启 `action2obs_bias`，并启用零动作静态增强。
+转换、独立审计、训练启动和真实模型 smoke 检查见该文档。
+
 ## 训练入口
 
 主训练入口：
@@ -68,7 +73,8 @@ python examples/wanvideo/model_training/train_rlinf.py ...
   - `True`：动作窗口与观测窗口对齐；
   - 两种模式最终都会 padding 到固定长度。
 - `action2obs_bias`：
-  - 若日志是按 `(a_t, o_{t+1})` 记录，建议设为 `True`；
+  - 若同一行保存 `o_t` 和随后执行的 `a_t`，且尚未移位，设为 `True`；
+  - 若动作已经与其对应的输出观测 `o_{t+1}` 位于同一行，设为 `False`，避免重复移位；
   - 内部会执行“右移一位 + 首位零动作”：
     - `a'[0] = 0`
     - `a'[t] = a[t-1]`

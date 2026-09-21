@@ -63,55 +63,25 @@ def load_model_from_single_file(state_dict, model_names, model_classes, model_re
         # model.load_state_dict(model_state_dict, assign=True)
         model = model.to_empty(device=device)
         # debug_state_dict_mismatch(model, model_state_dict)
-        model.load_state_dict(model_state_dict, strict=False, assign=True)
-        # if model has action_mlp1，then initialize it, should only be used in training
-        if hasattr(model, "action_mlp1"):
-            print("    Checking action_mlp1 weights for NaN/Inf...")
-            need_init1 = False
-            for m in model.action_mlp1:
-                if isinstance(m, torch.nn.Linear):
-                    if torch.isnan(m.weight).any() or torch.isinf(m.weight).any():
-                        need_init1 = True
-                        break
-                    if m.bias is not None and (torch.isnan(m.bias).any() or torch.isinf(m.bias).any()):
-                        need_init1 = True
-                        break
-
-            if need_init1:
-                print("    action_mlp1 contains NaN/Inf, reinitializing weights...")
-                for m in model.action_mlp1:
-                    if isinstance(m, torch.nn.Linear):
-                        # torch.nn.init.normal_(m.weight, 0, 0.01)
-                        torch.nn.init.xavier_uniform_(m.weight)
-                        if m.bias is not None:
-                            torch.nn.init.zeros_(m.bias)
+        incompatible = model.load_state_dict(model_state_dict, strict=False, assign=True)
+        # to_empty() leaves missing parameters uninitialized. Finite memory is
+        # not necessarily initialized memory; base Wan checkpoints have no action
+        # MLPs. Initialize by missing key, preserving every supplied tensor.
+        for name in incompatible.missing_keys:
+            if not name.startswith(("action_mlp1.", "action_mlp2.")):
+                if hasattr(model, "action_mlp1") or hasattr(model, "action_mlp2"):
+                    raise ValueError(f"Checkpoint is missing a required parameter: {name}")
+                continue
+            parameter = model.get_parameter(name)
+            if name.endswith(".weight"):
+                torch.nn.init.xavier_uniform_(parameter)
             else:
-                print("    action_mlp1 weights are fine, keeping original values.")
-
-        # if model has action_mlp2，then initialize it, should only be used in training
-        if hasattr(model, "action_mlp2"):
-            print("    Checking action_mlp2 weights for NaN/Inf...")
-            need_init2 = False
-            for m in model.action_mlp2:
-                if isinstance(m, torch.nn.Linear):
-                    if torch.isnan(m.weight).any() or torch.isinf(m.weight).any():
-                        need_init2 = True
-                        break
-                    if m.bias is not None and (torch.isnan(m.bias).any() or torch.isinf(m.bias).any()):
-                        need_init2 = True
-                        break
-
-            if need_init2:
-                print("    action_mlp2 contains NaN/Inf, reinitializing weights...")
-                for m in model.action_mlp2:
-                    if isinstance(m, torch.nn.Linear):
-                        # torch.nn.init.normal_(m.weight, 0, 0.01)
-                        torch.nn.init.xavier_uniform_(m.weight)
-                        if m.bias is not None:
-                            torch.nn.init.zeros_(m.bias)
-            else:
-                print("    action_mlp2 weights are fine, keeping original values.")
-
+                torch.nn.init.zeros_(parameter)
+        if incompatible.missing_keys:
+            print(f"    Initialized {len(incompatible.missing_keys)} missing action parameters.")
+        for name, parameter in model.named_parameters():
+            if name.startswith(("action_mlp1.", "action_mlp2.")) and not torch.isfinite(parameter).all():
+                raise ValueError(f"Non-finite action parameter in checkpoint: {name}")
 
         model = model.to(dtype=torch_dtype) 
         # model = model.to(dtype=torch_dtype, device=device)
@@ -516,4 +486,3 @@ class ModelManager:
     def to(self, device):
         for model in self.model:
             model.to(device)
-

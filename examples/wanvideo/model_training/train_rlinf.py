@@ -1,3 +1,9 @@
+import sys
+from pathlib import Path
+
+# Resolve this checkout even if another DiffSynth repository is installed editable.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
 import torch, os, json, ast
 import numpy as np
 from PIL import Image
@@ -7,6 +13,22 @@ from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launc
 from diffsynth.trainers.utils import RLinfDataset
 from diffsynth.trainers.utils import SimpleVLARealWorldRLinfDataset
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value.lower() in {'true', '1', 'yes'}:
+        return True
+    if value.lower() in {'false', '0', 'no'}:
+        return False
+    raise ValueError(f'Expected true or false, got {value!r}')
+
+
+def dataset_options(args):
+    return dict(Ta=args.Ta, To=args.To, stride=args.stride,
+                max_finish_step=args.max_finish_step,
+                retain_actions=args.retain_actions, action2obs_bias=args.action2obs_bias)
 
 # --- Patch Start: 允许加载包含 set 的权重文件 ---
 try:
@@ -32,11 +54,18 @@ class WanTrainingModule(DiffusionTrainingModule):
         action_dim=7,
     ):
         super().__init__()
+        if action_dim < 1 or not 0 <= static_video_prob <= 1:
+            raise ValueError('action_dim must be positive and static_video_prob must be in [0,1]')
+        os.environ['WAN_ACTION_DIM'] = str(action_dim)
         # Load models
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, enable_fp8_training=False)
         if audio_processor_config is not None:
             audio_processor_config = ModelConfig(model_id=audio_processor_config.split(":")[0], origin_file_pattern=audio_processor_config.split(":")[1])
         self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device="cpu", model_configs=model_configs, audio_processor_config=audio_processor_config)
+        for name, expected in [('action_mlp1', action_dim), ('action_mlp2', action_dim * 4)]:
+            branch = getattr(self.pipe.dit, name, None)
+            if branch is not None and branch[0].in_features != expected:
+                raise ValueError(f'{name} input dimension differs from requested action_dim={action_dim}')
         
         # Training mode
         self.switch_pipe_to_training_mode(
@@ -126,8 +155,11 @@ if __name__ == "__main__":
     parser.add_argument("--train_dataset_base_path", type=str, default="[]", help="Training dataset base paths in JSON list format.")
     parser.add_argument("--Ta", type=int, default=8, help="Action prediction window length")
     parser.add_argument("--To", type=int, default=4, help="Observation context window length")
-    parser.add_argument("--action2obs_bias", type=bool, default=False, help="Whether to use action2obs bias")
-    parser.add_argument("--retain_actions", type=bool, default=False, help="Whether to retain actions")
+    parser.add_argument("--action2obs_bias", type=parse_bool, default=False, help="Shift unaligned actions once in the loader")
+    parser.add_argument("--retain_actions", type=parse_bool, default=True, help="Whether to retain history actions")
+    parser.add_argument("--stride", type=int, default=1, help="Sliding-window stride")
+    parser.add_argument("--max_finish_step", type=int, default=440, help="Trajectory end limit; 0 uses the full trajectory")
+    parser.add_argument("--use_gradient_checkpointing", action="store_true", help="Recompute DiT activations during backward")
     args = parser.parse_args()
 
     def _parse_path_list(arg_value, arg_name):
@@ -152,28 +184,35 @@ if __name__ == "__main__":
     args.train_dataset_base_path = _parse_path_list(args.train_dataset_base_path, "--train_dataset_base_path")
     args.val_dataset_base_path = _parse_path_list(args.val_dataset_base_path, "--val_dataset_base_path")
     os.environ["WAN_ACTION_DIM"] = str(args.action_dim)
+    if min(args.Ta, args.To, args.stride, args.action_dim) < 1 or args.max_finish_step < 0:
+        parser.error('Ta, To, stride and action_dim must be positive; max_finish_step must be nonnegative')
+    if not 0 <= args.static_video_prob <= 1:
+        parser.error('static_video_prob must be in [0,1]')
+    options = dataset_options(args)
 
     if args.dataset == "RLinfDataset":
         dataset = RLinfDataset(
             base_path=args.train_dataset_base_path,
             repeat=args.dataset_repeat,
             action_dim=args.action_dim,
+            **options,
         )
         val_dataset = RLinfDataset(
             base_path=args.val_dataset_base_path,
             repeat=1,
             action_dim=args.action_dim,
+            **options,
         )
     elif args.dataset == "SimpleVLARealWorldRLinfDataset":
         dataset = SimpleVLARealWorldRLinfDataset(
             base_path=args.train_dataset_base_path,
             repeat=args.dataset_repeat,
-            action_dim=args.action_dim,
+            **options,
         )
         val_dataset = SimpleVLARealWorldRLinfDataset(
             base_path=args.val_dataset_base_path,
             repeat=1,
-            action_dim=args.action_dim,
+            **options,
         )
     else:
         raise NotImplementedError('this dataset type not implemented')
@@ -188,6 +227,7 @@ if __name__ == "__main__":
         lora_rank=args.lora_rank,
         lora_checkpoint=args.lora_checkpoint,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
+        use_gradient_checkpointing=args.use_gradient_checkpointing,
         extra_inputs=args.extra_inputs,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,

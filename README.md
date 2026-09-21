@@ -69,7 +69,8 @@ Key parameters:
   - `True`: action window is aligned with observation window.
   - Both modes are padded to a fixed final length.
 - `action2obs_bias`:
-  - For logs recorded as `(a_t, o_{t+1})`, set `True`.
+  - Set `True` when each row contains `o_t` and the subsequent command `a_t`, without a prior shift.
+  - Set `False` when commands are already aligned to their output observations `o_{t+1}`; do not shift twice.
   - Internally applies right shift with leading zero action:
     - `a'[0] = 0`
     - `a'[t] = a[t-1]`

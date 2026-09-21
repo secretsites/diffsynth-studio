@@ -20,6 +20,7 @@ model_loader_configs = [
     (None, "3f4e37438f72ef88cd27b161fd1b193c", ["wan_video_dit"], [WanModel], "civitai"), # 5B TI2V action
     (None, "d3abb829857dff2d9129d2f396a7eace", ["wan_video_dit"], [WanModel], "civitai"), # 5B TI2V action
     (None, "bc4824aef7c3f23d3378cec6e2b1316c", ["wan_video_dit"], [WanModel], "civitai"), # 5B TI2V action
+    (None, "cd86b8137f89754c6c4557e285274a95", ["wan_video_dit"], [WanModel], "civitai"), # 5B TI2V 58D full checkpoint
     (None, "fcc43a93949201bafeb34aa1eb8bc50f", ["wan_video_dit"], [WanModel], "civitai"), # 5B TI2V action (agx/action_dim=10)
     (None, "6efc7e19e87c1755f17dec14be3d0bf1", ["wan_video_dit"], [WanModel], "civitai"), # 5B TI2V action
     #

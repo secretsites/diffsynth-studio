@@ -746,8 +746,9 @@ class WanModelStateDictConverter:
                 "length_conditonal_frames": 5,
                 "action_dim": 10,
             }
-        elif hash_state_dict_keys(state_dict) == "bc4824aef7c3f23d3378cec6e2b1316c":
-            # LIBERO 7 action_dim , default
+        elif hash_state_dict_keys(state_dict) in {"bc4824aef7c3f23d3378cec6e2b1316c", "cd86b8137f89754c6c4557e285274a95"}:
+            # Complete action checkpoints carry their actual input dimension.
+            checkpoint_action_dim = state_dict["action_mlp1.0.weight"].shape[1]
             config = {
                 "has_image_input": False,
                 "patch_size": [1, 2, 2],
@@ -766,7 +767,7 @@ class WanModelStateDictConverter:
                 "fuse_vae_embedding_in_latents": True,
                 "action_mode": "both",
                 "length_conditonal_frames": 5,
-                "action_dim": action_dim_override,
+                "action_dim": checkpoint_action_dim,
             }
         elif hash_state_dict_keys(state_dict) == "0c81d47223c50d8d74106f79310ae207":
             # Wan-AI/Wan2.2-TI2V-5B-action-singleckpt
