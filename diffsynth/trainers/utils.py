@@ -219,6 +219,7 @@ def launch_training_task(
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)],
     )
     model, optimizer, dataloader, val_dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, val_dataloader, scheduler)
+    optimizer.zero_grad(set_to_none=True)
 
     global_step = 0
     epoch_loss = 0.0
@@ -231,7 +232,6 @@ def launch_training_task(
 
         for data in tqdm(dataloader):
             with accelerator.accumulate(model):
-                optimizer.zero_grad()
                 if dataset.load_from_cache:
                     loss = model({}, inputs=data)
                 else:
@@ -240,6 +240,7 @@ def launch_training_task(
                 accelerator.backward(loss)
 
                 optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
                 model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
 

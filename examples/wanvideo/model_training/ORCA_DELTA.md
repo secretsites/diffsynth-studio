@@ -107,3 +107,7 @@ CUDA_VISIBLE_DEVICES=0 python examples/wanvideo/model_training/smoke_orca_delta.
 ```
 
 Smoke 检查使用真实 5B 模型与原生训练损失，各执行一次普通样本和强制静态样本的前向/反向，检查动作维度、输入、损失与代表性梯度。无优化器更新，不保存模型；它验证运行通路，不是训练质量评估。全零输入时第一层 action MLP 的 weight 梯度为零是正常乘法结果，下游 bias 和主干仍可有梯度。
+
+## 双卡完整滑窗入口
+
+两张 GPU 遍历全部训练窗口的配置见 [ORCA_DUAL_GPU.md](ORCA_DUAL_GPU.md)。该入口使用同一原生模型和损失，修正梯度累积、核验实际窗口覆盖，并提供优化器状态恢复；单卡原生脚本的501batch上限不适用于该入口。

@@ -217,8 +217,9 @@ class RLinfDataset(torch.utils.data.Dataset):
         assert act_win.shape[0] == self.Ta + self.To + 1, f"action len is not right: {act_win.shape[0]} != {self.Ta + self.To + 1}"
         
 
-        print("action start, action end is ", action_s, action_e)
-        print("video start, video end is ", vs, ve)
+        if os.environ.get('WAN_DEBUG', '0').lower() in {'1', 'true', 'yes', 'on'}:
+            print("action start, action end is ", action_s, action_e)
+            print("video start, video end is ", vs, ve)
 
 
         # 转换为与 MyNpyDatasetnew 对齐的格式
