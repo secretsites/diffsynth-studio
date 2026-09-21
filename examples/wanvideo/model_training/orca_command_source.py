@@ -340,4 +340,3 @@ def read_action_and_state(
     action = action.copy()
     action[:, ARM_ACTION_DIM:] = hand_command
     return action, state, diagnostics
-
