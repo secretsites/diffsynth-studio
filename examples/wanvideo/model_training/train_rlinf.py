@@ -1,12 +1,27 @@
+import sys
+from pathlib import Path
+
+# Run this checkout even when another DiffSynth repository is installed editable.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
 import torch, os, json, ast
 import numpy as np
 from PIL import Image
 from diffsynth import load_state_dict
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task, wan_parser
-from diffsynth.trainers.utils import RLinfDataset
-from diffsynth.trainers.utils import SimpleVLARealWorldRLinfDataset
+from diffsynth.trainers.dataset import RLinfDataset, SimpleVLARealWorldRLinfDataset
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value.lower() in {"true", "1", "yes"}:
+        return True
+    if value.lower() in {"false", "0", "no"}:
+        return False
+    raise ValueError(f"Expected true or false, got {value!r}")
 
 # --- Patch Start: 允许加载包含 set 的权重文件 ---
 try:
@@ -126,8 +141,11 @@ if __name__ == "__main__":
     parser.add_argument("--train_dataset_base_path", type=str, default="[]", help="Training dataset base paths in JSON list format.")
     parser.add_argument("--Ta", type=int, default=8, help="Action prediction window length")
     parser.add_argument("--To", type=int, default=4, help="Observation context window length")
-    parser.add_argument("--action2obs_bias", type=bool, default=False, help="Whether to use action2obs bias")
-    parser.add_argument("--retain_actions", type=bool, default=False, help="Whether to retain actions")
+    parser.add_argument("--action2obs_bias", type=parse_bool, default=False, help="Whether to use action2obs bias")
+    parser.add_argument("--retain_actions", type=parse_bool, default=True, help="Whether to retain context actions")
+    parser.add_argument("--stride", type=int, default=1, help="Sliding-window stride in frames")
+    parser.add_argument("--max_finish_step", type=int, default=0, help="Trajectory end limit; 0 uses the full trajectory")
+    parser.add_argument("--action_time_encoding", choices=["sinusoidal", "none"], default=os.environ.get("WAN_ACTION_TIME_ENCODING", "sinusoidal"), help="Action context time encoding; none reproduces legacy behavior")
     args = parser.parse_args()
 
     def _parse_path_list(arg_value, arg_name):
@@ -152,28 +170,36 @@ if __name__ == "__main__":
     args.train_dataset_base_path = _parse_path_list(args.train_dataset_base_path, "--train_dataset_base_path")
     args.val_dataset_base_path = _parse_path_list(args.val_dataset_base_path, "--val_dataset_base_path")
     os.environ["WAN_ACTION_DIM"] = str(args.action_dim)
+    os.environ["WAN_ACTION_TIME_ENCODING"] = args.action_time_encoding
+    if args.stride < 1 or args.Ta < 1 or args.To < 1 or args.max_finish_step < 0:
+        parser.error("stride, Ta and To must be positive; max_finish_step must be nonnegative")
+    dataset_kwargs = dict(Ta=args.Ta, To=args.To, stride=args.stride,
+                          max_finish_step=args.max_finish_step,
+                          retain_actions=args.retain_actions, action2obs_bias=args.action2obs_bias)
 
     if args.dataset == "RLinfDataset":
         dataset = RLinfDataset(
             base_path=args.train_dataset_base_path,
             repeat=args.dataset_repeat,
             action_dim=args.action_dim,
+            **dataset_kwargs,
         )
         val_dataset = RLinfDataset(
             base_path=args.val_dataset_base_path,
             repeat=1,
             action_dim=args.action_dim,
+            **dataset_kwargs,
         )
     elif args.dataset == "SimpleVLARealWorldRLinfDataset":
         dataset = SimpleVLARealWorldRLinfDataset(
             base_path=args.train_dataset_base_path,
             repeat=args.dataset_repeat,
-            action_dim=args.action_dim,
+            **dataset_kwargs,
         )
         val_dataset = SimpleVLARealWorldRLinfDataset(
             base_path=args.val_dataset_base_path,
             repeat=1,
-            action_dim=args.action_dim,
+            **dataset_kwargs,
         )
     else:
         raise NotImplementedError('this dataset type not implemented')

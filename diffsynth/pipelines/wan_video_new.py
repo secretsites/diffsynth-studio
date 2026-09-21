@@ -1601,7 +1601,7 @@ def model_fn_wan_video(
         if action.dim() == 2:
             action = action.unsqueeze(0)
         # [B, T, action_dim] -> [B, T, dim]
-        action_emb = dit.action_mlp1(action)
+        action_emb = dit.embed_action_context(action)
         if context is not None:
             context = torch.cat([context, action_emb], dim=1)
         else:
@@ -1683,7 +1683,7 @@ def model_fn_wan_video(
                 torch.zeros((2, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device),
                 torch.ones((latents.shape[2] - 2, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device) * timestep
             ]).flatten()
-            t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep).unsqueeze(0)).repeat(B, 1, 1)
+            t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep).unsqueeze(0)).repeat(latents.shape[0], 1, 1)
             if dit.enable_action_modulation:
                 action_emb = action_emb.unsqueeze(2).repeat(1, 1, spatial_expand, 1).flatten(1, 2)
                 t = t + action_emb

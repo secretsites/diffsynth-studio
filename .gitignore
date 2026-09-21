@@ -5,6 +5,7 @@ __pycache__
 
 outputs/*
 runs/*
+work/orca_probe_cache/
 
 extra_libs*
 diffsynth/models/install_extra_libs.sh

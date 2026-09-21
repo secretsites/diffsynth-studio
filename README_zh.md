@@ -2,6 +2,17 @@
 
 本仓库是基于 DiffSynth-Studio 的 Wan2.2-TI2V-5B 世界模型训练/推理分支。
 
+ORCA H2 + Sharpa 58D command 数据在全数据训练前，可运行
+[单卡全参数 action-conditioning 快速验证](examples/wanvideo/model_training/ACTION_PROBE.md)：
+包括小样本微调、独立轨迹上的正确/错配动作评估，以及相同噪声下的生成视频对照。
+
+长训练入口 `examples/wanvideo/model_training/train_orca_sampled.py` 支持每个采样轮
+从每条完整训练轨迹各随机抽取两个不同窗口，并逐轮重新采样。默认训练 1000 个采样轮，
+保存第 100/200/500/1000 轮权重，另维护一份包含优化器的滚动续训文件；
+这里的“采样轮”不同于全部滑窗遍历一次的 epoch。
+该入口要求事先冻结的 `--validation-manifest`，并用 `--resume` 恢复同一配置。
+训练和保存参数、动作时间编码、实际采样清单会记录到运行目录。
+
 ## 训练入口
 
 主训练入口：
@@ -32,11 +43,18 @@ python examples/wanvideo/model_training/train_rlinf.py ...
 <base_path>/
   <sub_path>/
     <seed_name>/
-      rgb.npy      # shape [T, N, 3, H, W]
+      rgb.npy      # shape [T, N, 3, H, W] 或 [T, N, H, W, 3]
       actions.npy  # shape [T, N, action_dim]
 ```
 
 `RLinfDataset` 会扫描 `step_name/seed_name` 并构建滑窗样本。
+
+ORCA command 数据使用 `train_data/orca/episode_NNNNNN/` 和
+`val_data/orca/episode_NNNNNN/`；分别将 `train_data` / `val_data` 作为 base path。
+额外的 `states.npy` 是归一化关节状态，用于构造保持动作。
+该数据为 14 维双臂命令 + 44 维原生手部 desired 命令，需 `action_dim=58`。
+转换时已经令 `actions[t]=source_action[t-1]`，因此必须设置
+`action2obs_bias=False`，不能再次移位。ORCA 专用探针会保留真实的初始保持动作。
 
 ### 2）真实世界轨迹数据集（`SimpleVLARealWorldRLinfDataset`）
 
@@ -68,12 +86,40 @@ python examples/wanvideo/model_training/train_rlinf.py ...
   - `True`：动作窗口与观测窗口对齐；
   - 两种模式最终都会 padding 到固定长度。
 - `action2obs_bias`：
-  - 若日志是按 `(a_t, o_{t+1})` 记录，建议设为 `True`；
+  - 若同一行保存观测 `o_t` 和随后执行的 `a_t`，且尚未转换到输出帧对齐，可设为 `True`；
+  - 若动作已经与其导致的 `o_{t+1}` 位于同一行，应设为 `False`；
   - 内部会执行“右移一位 + 首位零动作”：
     - `a'[0] = 0`
     - `a'[t] = a[t-1]`
   - 目的是让数据对齐到世界模型的训练对为 `(a_t, o_{t+1})`。
 - `repeat`：数据重复倍数。
+- `stride`：滑窗步长，默认 1。增大步长会减少重叠窗口；不同 stride 的 epoch 不能直接比较。
+- `max_finish_step`：轨迹截断位置，默认 0 使用整条轨迹。
+- `max_train_steps_per_epoch`：仅用于显式限制调试轮数，默认不限制；一轮会完整遍历训练集。
+
+ORCA command 数据全量训练应使用 `--action_dim 58 --Ta 8 --To 4
+--retain_actions true --action2obs_bias false --max_finish_step 0`。
+保留官方 `val_data` 作为验证集；这里的“全量训练集”指全部 136 个训练 episode。
+绝对关节位置命令中的零向量并不代表保持当前姿态，因此该数据应设置
+`--static_video_prob 0`，避免通用入口的“静态视频 + 零动作”增强。
+
+## 动作时间编码
+
+动作 cross-attention 现在默认使用固定正弦时间编码：
+`action_mlp1(action[t]) + PE(t)`。训练与 rollout 共用
+`WanModel.embed_action_context()`，原有按 4 帧动作拼接的 modulation 分支保留。
+在 5 帧条件模式中，槽位 0 表示 episode 参考帧，1–4 表示最近历史，5 起为未来动作。
+这是窗口内的位置编号，不是参考帧与当前帧的实际时间间隔；每个 rollout chunk 使用相同局部编号。
+
+训练入口可用 `--action_time_encoding sinusoidal`（默认）或 `none`；其他脚本及推理可通过
+`WAN_ACTION_TIME_ENCODING=sinusoidal` / `none` 设置，训练和推理必须一致。
+时间编码不增加参数，checkpoint 张量形状和键名不变；旧无时间编码 checkpoint 的行为复现必须显式选 `none`。
+该开关不存放在权重张量中，应与训练配置一起保存。补充顺序信息不等于已经通过动作控制验证。
+
+吞吐测量入口 `examples/wanvideo/model_training/benchmark_orca_training.py` 会短暂进行全参数更新，
+分别测量预缓存 latent 和在线 VAE 的每步时间，不保存模型权重。其数字适用于单卡、batch=1、
+256×256、8 帧预测、BF16 骨干及 AdamW 状态、FP32 动作 MLP 的探针训练配置；
+更改为 FP32 主权重、CPU offload 或更长预测窗口后需要重新测速。
 
 
 ## `action_dim` 与 Checkpoint Hash 映射（关键）

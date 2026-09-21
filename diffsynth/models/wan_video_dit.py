@@ -387,6 +387,7 @@ class WanModel(torch.nn.Module):
         action_mode: str = "both",
         length_conditonal_frames: int = 5,
         action_dim: int = 7,
+        action_time_encoding: Optional[str] = None,
     ):
         super().__init__()
         self.dim = dim
@@ -411,6 +412,9 @@ class WanModel(torch.nn.Module):
         if action_mode not in {"crossattn", "modulation", "both"}:
             raise ValueError(f"Unsupported action_mode: {action_mode}")
         self.action_mode = action_mode
+        self.action_time_encoding = action_time_encoding or os.environ.get("WAN_ACTION_TIME_ENCODING", "sinusoidal")
+        if self.action_time_encoding not in {"sinusoidal", "none"}:
+            raise ValueError(f"Unsupported action_time_encoding: {self.action_time_encoding}")
         self.has_action_mode = True
         self.enable_action_crossattn = self.action_mode in {"crossattn", "both"}
         self.enable_action_modulation = self.action_mode in {"modulation", "both"}
@@ -432,6 +436,7 @@ class WanModel(torch.nn.Module):
         self.five_frame_condition = self.length_conditonal_frames == 5
       
         print(f"The MODE of action control is {self.action_mode}")
+        print(f"Action time encoding: {self.action_time_encoding}")
         print(f'The MODE of length conditional frames is {self.length_conditonal_frames}')
 
         if self.enable_action_crossattn:
@@ -477,6 +482,21 @@ class WanModel(torch.nn.Module):
             self.control_adapter = SimpleAdapter(in_dim_control_adapter, dim, kernel_size=patch_size[1:], stride=patch_size[1:])
         else:
             self.control_adapter = None
+
+    def embed_action_context(self, action: torch.Tensor):
+        """Encode ordered action slots for both training and rollout.
+
+        Slot 0 is the episode reference; slots 1:5 are recent history and
+        slots 5: are future commands in the five-frame conditioning layout.
+        These are local sequence positions, not absolute episode timestamps.
+        A fresh rollout chunk uses the same local positions as training.
+        """
+        context = self.action_mlp1(action)
+        if self.action_time_encoding == "sinusoidal":
+            positions = torch.arange(action.shape[-2], device=action.device, dtype=torch.float32)
+            time_embedding = sinusoidal_embedding_1d(self.dim, positions).to(context.dtype)
+            context = context + time_embedding
+        return context
 
     def patchify(self, x: torch.Tensor, control_camera_latents_input: Optional[torch.Tensor] = None):
         x = self.patch_embedding(x)
@@ -746,8 +766,9 @@ class WanModelStateDictConverter:
                 "length_conditonal_frames": 5,
                 "action_dim": 10,
             }
-        elif hash_state_dict_keys(state_dict) == "bc4824aef7c3f23d3378cec6e2b1316c":
-            # LIBERO 7 action_dim , default
+        elif hash_state_dict_keys(state_dict) in {"bc4824aef7c3f23d3378cec6e2b1316c", "cd86b8137f89754c6c4557e285274a95"}:
+            # Complete action-conditioned checkpoints carry their input dimension.
+            checkpoint_action_dim = state_dict["action_mlp1.0.weight"].shape[1]
             config = {
                 "has_image_input": False,
                 "patch_size": [1, 2, 2],
@@ -766,7 +787,7 @@ class WanModelStateDictConverter:
                 "fuse_vae_embedding_in_latents": True,
                 "action_mode": "both",
                 "length_conditonal_frames": 5,
-                "action_dim": action_dim_override,
+                "action_dim": checkpoint_action_dim,
             }
         elif hash_state_dict_keys(state_dict) == "0c81d47223c50d8d74106f79310ae207":
             # Wan-AI/Wan2.2-TI2V-5B-action-singleckpt

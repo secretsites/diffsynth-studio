@@ -31,7 +31,7 @@ class RLinfDataset(torch.utils.data.Dataset):
             In both modes, the final action sequence is padded to length Ta + To + 1.
         stride: Sliding-window stride for sampling.
         action_dim: Action dimension (used for zero padding).
-        max_finish_step: Maximum usable end step per trajectory (to avoid sampling overly long tails).
+        max_finish_step: Maximum usable end step per trajectory; 0 uses the full trajectory.
         repeat: Dataset repetition factor.
         action2obs_bias:
             Whether to enable action->observation alignment bias.
@@ -48,7 +48,7 @@ class RLinfDataset(torch.utils.data.Dataset):
         retain_actions: bool = True,
         stride: int = 1,
         action_dim: int = 7,
-        max_finish_step: int = 440,
+        max_finish_step: int = 0,
         repeat: int = 1,
         action2obs_bias: bool = False,
     ):
@@ -108,10 +108,7 @@ class RLinfDataset(torch.utils.data.Dataset):
             video_shape = np.load(os.path.join(data_path, "rgb.npy"), mmap_mode='r').shape
             T, N = video_shape[0], video_shape[1]  # (T, N, C, H, W)
 
-            if T > self.max_finish_step:
-                finish_step = self.max_finish_step
-            else:
-                finish_step = T - 1
+            finish_step = min(T - 1, self.max_finish_step) if self.max_finish_step > 0 else T - 1
             
             episode_idx = len(self.episode_info)
             self.episode_info.append((data_path, finish_step, T, N))
@@ -153,8 +150,8 @@ class RLinfDataset(torch.utils.data.Dataset):
         
         if vs < 0:
             # padding the first image To 
-            pad = np.repeat(video_np[0:1, env_id], self.To, axis=0)  # [1, C, H, W] -> [-vs, C, H, W]
-            vid_win = np.concatenate([pad, video_np[:self.Ta, env_id]], axis=0)  # [ve-vs, C, H, W]
+            pad = np.repeat(video_np[0:1, env_id], -vs, axis=0)
+            vid_win = np.concatenate([pad, video_np[:ve, env_id]], axis=0)
         else:
             vid_win = video_np[vs:ve, env_id]  # [ve-vs, C, H, W]
 
@@ -162,14 +159,16 @@ class RLinfDataset(torch.utils.data.Dataset):
             vid_win = np.concatenate([video_np[0:1, env_id], vid_win], axis=0)  # [1+ve-vs, C, H, W]
 
         if action_s < 0:
-            # padding the zero action To times 
-            pad = np.zeros((self.To, self.action_dim))  # [To, action_dim]
-            act_win = np.concatenate([pad, action_np[:self.Ta, env_id]], axis=0)  # [action_e-action_s, action_dim]
+            pad = np.repeat(action_np[0:1, env_id], -action_s, axis=0)
+            act_win = np.concatenate([pad, action_np[:action_e, env_id]], axis=0)
         else:
             act_win = action_np[action_s:action_e, env_id]  # [action_e-action_s, action_dim]
         
-        left_padding_length = 1 if self.retain_actions else self.To + 1       
-        act_win = np.concatenate([np.zeros((left_padding_length, self.action_dim)), act_win], axis=0)  # [action_e-action_s, action_dim]
+        if self.retain_actions:
+            prefix_actions = action_np[0:1, env_id]
+        else:
+            prefix_actions = np.zeros((self.To + 1, self.action_dim), dtype=action_np.dtype)
+        act_win = np.concatenate([prefix_actions, act_win], axis=0)
 
         action_tensor = torch.from_numpy(act_win).float()
         

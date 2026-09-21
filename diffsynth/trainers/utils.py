@@ -223,6 +223,9 @@ def launch_training_task(
     global_step = 0
     epoch_loss = 0.0
     epoch_steps = 0
+    max_epoch_steps = getattr(args, "max_train_steps_per_epoch", None)
+    if max_epoch_steps is not None and max_epoch_steps < 1:
+        raise ValueError("max_train_steps_per_epoch must be positive or None")
 
     for epoch_id in range(num_epochs):
 
@@ -249,8 +252,8 @@ def launch_training_task(
                 epoch_steps += 1
                 global_step += 1
 
-                # to avoid the too long epoch 
-                if epoch_steps > 500:
+                # Full dataset traversal by default; short debug epochs are explicit.
+                if max_epoch_steps is not None and epoch_steps >= max_epoch_steps:
                     break
         if accelerator.is_main_process and epoch_steps > 0:
             writer.add_scalar("Loss/epoch", epoch_loss / epoch_steps, epoch_id)
@@ -331,6 +334,7 @@ def wan_parser():
     parser.add_argument("--audio_processor_config", type=str, default=None, help="Model ID with origin paths to the audio processor config, e.g., Wan-AI/Wan2.2-S2V-14B:wav2vec2-large-xlsr-53-english/")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--num_epochs", type=int, default=1, help="Number of epochs.")
+    parser.add_argument("--max_train_steps_per_epoch", type=int, default=None, help="Optional debug limit on batches per epoch. By default traverse the full dataset.")
     parser.add_argument("--output_path", type=str, default="./models", help="Output save path.")
     parser.add_argument("--remove_prefix_in_ckpt", type=str, default="pipe.dit.", help="Remove prefix in ckpt.")
     parser.add_argument("--trainable_models", type=str, default=None, help="Models to train, e.g., dit, vae, text_encoder.")
