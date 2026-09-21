@@ -141,32 +141,59 @@ def audit_processed_windows(output, total, updates, world):
     return result
 
 
-def save_checkpoint(model, optimizer, output, epoch, completed_updates, completed_windows, config, rank, final=False):
+def save_checkpoint(model, optimizer, output, epoch, completed_updates, completed_windows, config, rank, final=False,
+                    checkpoint_dir=None, export_final=True):
     synchronize()
     if rank == 0:
-        if shutil.disk_usage(output).free < 35 * 2**30:
-            raise RuntimeError('Need at least 35 GiB free for an atomic resumable checkpoint')
+        checkpoint_dir = checkpoint_dir or output
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        tensor_bytes = sum(t.numel() * t.element_size() for t in model.pipe.dit.state_dict().values())
+        optimizer_bytes = sum(t.numel() * t.element_size() for state in optimizer.state.values()
+                              for t in state.values() if isinstance(t, torch.Tensor))
+        if shutil.disk_usage(checkpoint_dir).free < tensor_bytes + optimizer_bytes + 2 * 2**30:
+            raise RuntimeError('Insufficient free space for an atomic resumable checkpoint plus 2 GiB reserve')
         started = time.monotonic()
         # torch.save streams CUDA storages to disk; no second full CPU optimizer copy.
         payload = {'dit': model.pipe.dit.state_dict(), 'optimizer': optimizer.state_dict(),
                    'epoch': epoch, 'completed_updates': completed_updates,
                    'completed_windows': completed_windows, 'config': config}
-        tmp = output / 'resume_latest.pt.tmp'
+        tmp = checkpoint_dir / 'resume_latest.pt.tmp'
         torch.save(payload, tmp)
-        tmp.replace(output / 'resume_latest.pt')
+        tmp.replace(checkpoint_dir / 'resume_latest.pt')
         del payload
-        if final:
+        export_path = None
+        if final and export_final:
+            if shutil.disk_usage(output).free < tensor_bytes + 2 * 2**30:
+                raise RuntimeError('Insufficient free space for final DiT export plus 2 GiB reserve')
             state = {k: v.detach().cpu().contiguous() for k, v in model.pipe.dit.state_dict().items()}
-            path = output / 'epoch-1.safetensors'
+            path = output / f'epoch-{epoch}.safetensors'
             save_file(state, str(path.with_suffix('.safetensors.tmp')),
                       metadata={'action_representation': 'delta_joint_target_error', 'action_dim': '58',
-                                'action2obs_bias_in_loader': 'true', 'epochs_completed': '1'})
+                                'action2obs_bias_in_loader': 'true', 'epochs_completed': str(epoch)})
             path.with_suffix('.safetensors.tmp').replace(path)
+            export_path = str(path)
             del state
         atomic_json(output / 'checkpoint_status.json', {'epoch': epoch, 'completed_updates': completed_updates,
-                    'completed_windows': completed_windows, 'final': final,
+                    'completed_windows': completed_windows, 'final': final, 'export': export_path,
+                    'resume_checkpoint': str(checkpoint_dir / 'resume_latest.pt'),
                     'save_seconds': time.monotonic() - started})
     synchronize()
+
+
+def check_initial_checkpoint(payload, config, epoch_index):
+    """A new epoch starts only from a complete preceding epoch, keeping AdamW."""
+    previous = payload['config']
+    for key in ['global_batch', 'learning_rate', 'weight_decay', 'static_probability',
+                'world_size', 'dataset_contract_sha256', 'model', 'dataset', 'seed',
+                'gradient_checkpointing', 'fused_adamw', 'action_dim', 'action2obs_bias']:
+        if previous[key] != config[key]:
+            raise ValueError(f'Initial checkpoint configuration mismatch: {key}')
+    expected_updates = math.ceil(config['train_windows'] / config['global_batch'])
+    if (payload['epoch'] != epoch_index or payload['completed_windows'] != config['train_windows']
+            or payload['completed_updates'] != expected_updates):
+        raise ValueError('Initial checkpoint must contain the complete preceding epoch')
+    if not payload['optimizer']['state']:
+        raise ValueError('Initial checkpoint has no optimizer state')
 
 
 def validate(model, dataset, indices, args, rank, world, phase):
@@ -217,14 +244,15 @@ def main(args):
     val = RLinfDataset(str(args.dataset / 'val_data'), **data_options)
     if not all(c['representation'] == 'delta_joint_target_error' for c in train.action_contracts) or not train.action_contracts:
         raise ValueError('This launcher requires the audited delta dataset contract')
-    order = make_order(len(train), args.seed, 0)
+    order = make_order(len(train), args.seed, args.epoch_index)
     val_indices = np.sort(np.random.default_rng(args.seed + 77).choice(len(val), min(args.val_windows, len(val)), replace=False))
     config = {**{k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
               'world_size': world, 'accumulation_per_rank': accumulation, 'micro_batch_per_rank': 1,
               'train_windows': len(train), 'train_episodes': len(train.episode_info),
               'val_windows_total': len(val), 'val_episodes': len(val.episode_info),
               'sample_order_sha256': hashlib.sha256(order.tobytes()).hexdigest(),
-              'epochs': 1, 'action_dim': 58, 'action2obs_bias': True, 'full_parameter_training': True,
+              'epochs': 1, 'cumulative_epoch': args.epoch_index + 1,
+              'action_dim': 58, 'action2obs_bias': True, 'full_parameter_training': True,
               'dataset_contract_sha256': {name: hashlib.sha256((args.dataset / name).read_bytes()).hexdigest()
                                           for name in ['dataset_info.json', 'action_stats.json', 'adaptation_verification.json']},
               'torch': torch.__version__, 'optimizer_state_precision': 'same as BF16 parameters',
@@ -252,18 +280,32 @@ def main(args):
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=args.learning_rate,
                                  weight_decay=args.weight_decay, fused=args.fused_adamw)
     start_update = 0
-    if args.resume:
+    if args.resume or args.initial_checkpoint:
         # Sequential CPU loads prevent two 30GB optimizer snapshots exhausting host RAM.
         for loading_rank in range(world):
             if loading_rank == rank:
-                payload = torch.load(args.resume, map_location='cpu', weights_only=False)
-                for key in ['sample_order_sha256', 'global_batch', 'learning_rate', 'weight_decay',
-                            'static_probability', 'world_size', 'dataset_contract_sha256']:
-                    if payload['config'][key] != config[key]:
-                        raise ValueError(f'Resume configuration mismatch: {key}')
+                payload = torch.load(args.resume or args.initial_checkpoint, map_location='cpu', weights_only=False)
+                if args.initial_checkpoint:
+                    check_initial_checkpoint(payload, config, args.epoch_index)
+                else:
+                    for key in ['sample_order_sha256', 'global_batch', 'learning_rate', 'weight_decay',
+                                'static_probability', 'world_size', 'dataset_contract_sha256']:
+                        if payload['config'][key] != config[key]:
+                            raise ValueError(f'Resume configuration mismatch: {key}')
                 model.pipe.dit.load_state_dict(payload['dit'], strict=True)
                 optimizer.load_state_dict(payload['optimizer'])
-                start_update = payload['completed_updates']
+                start_update = payload['completed_updates'] if args.resume else 0
+                if rank == 0:
+                    steps = [float(s['step']) for s in payload['optimizer']['state'].values() if 'step' in s]
+                    atomic_json(args.output / 'initialization.json', {
+                        'mode': 'resume_epoch' if args.resume else 'continue_next_epoch',
+                        'checkpoint': str(args.resume or args.initial_checkpoint),
+                        'source_completed_epochs': payload['epoch'],
+                        'source_run': payload['config']['output'],
+                        'source_completed_updates': payload['completed_updates'],
+                        'optimizer_state_count': len(payload['optimizer']['state']),
+                        'optimizer_step_min': min(steps), 'optimizer_step_max': max(steps),
+                        'start_update_in_epoch': start_update})
                 del payload
                 gc.collect()
             if world > 1: dist.barrier()
@@ -274,8 +316,8 @@ def main(args):
     end_update = min(total_updates, args.warmup_updates + args.benchmark_updates) if args.benchmark else total_updates
     if args.stop_after_updates and not args.benchmark:
         end_update = min(end_update, args.stop_after_updates)
-    if end_update <= start_update:
-        raise ValueError('Run limit must be after the resumed optimizer update')
+    if end_update < start_update:
+        raise ValueError('Run limit must not precede the resumed optimizer update')
     selected_order = order[:min(len(order), end_update * args.global_batch)]
     indices = shard_order(selected_order, world, rank)[start_update * accumulation:]
     loader = create_loader(train, indices, args.workers)
@@ -299,7 +341,7 @@ def main(args):
         step_started = time.monotonic()
         for micro in range(local_micro_steps):
             index, valid, data = next(iterator)
-            seed_sample(args.seed, 0, index)
+            seed_sample(args.seed, args.epoch_index, index)
             context = wrapped.no_sync() if world > 1 and micro < local_micro_steps - 1 else contextlib.nullcontext()
             with context, torch.autocast('cuda', dtype=torch.bfloat16):
                 loss = wrapped(data)
@@ -341,10 +383,11 @@ def main(args):
             if args.val_updates and (update + 1) % args.val_updates == 0 and update + 1 < end_update:
                 validate(model, val, val_indices, args, rank, world, f'update-{update + 1}')
             if args.checkpoint_updates and (update + 1) % args.checkpoint_updates == 0 and update + 1 < end_update:
-                save_checkpoint(model, optimizer, args.output, 0, update + 1, completed_windows, config, rank)
+                save_checkpoint(model, optimizer, args.output, args.epoch_index, update + 1, completed_windows,
+                                config, rank, checkpoint_dir=args.checkpoint_dir)
     del iterator, loader
     change = float((probe.detach().float() - initial_probe.float()).abs().max().item())
-    if change == 0:
+    if change == 0 and end_update > start_update:
         raise RuntimeError('Action weights did not change after optimizer updates')
     if world > 1:
         # Check representative action parameters agree after real optimizer updates.
@@ -369,10 +412,13 @@ def main(args):
         if rank == 0:
             audit_processed_windows(args.output, len(order), end_update, world)
         validate(model, val, val_indices, args, rank, world, 'final_fixed')
-        validate(model, val, np.arange(len(val)), args, rank, world, 'final_full')
-        save_checkpoint(model, optimizer, args.output, 1, end_update, completed_windows, config, rank, final=True)
+        if args.full_validation_at_end:
+            validate(model, val, np.arange(len(val)), args, rank, world, 'final_full')
+        save_checkpoint(model, optimizer, args.output, args.epoch_index + 1, end_update, completed_windows,
+                        config, rank, final=True, checkpoint_dir=args.checkpoint_dir, export_final=args.export_final)
     elif not args.benchmark:
-        save_checkpoint(model, optimizer, args.output, 0, end_update, completed_windows, config, rank)
+        save_checkpoint(model, optimizer, args.output, args.epoch_index, end_update, completed_windows,
+                        config, rank, checkpoint_dir=args.checkpoint_dir)
     if rank == 0:
         finished = args.benchmark or epoch_complete
         result['epoch_complete'] = epoch_complete
@@ -403,14 +449,22 @@ def parse_args():
     p.add_argument('--val-updates', type=int, default=250)
     p.add_argument('--val-windows', type=int, default=120)
     p.add_argument('--checkpoint-updates', type=int, default=500)
-    p.add_argument('--resume', type=Path)
+    restore = p.add_mutually_exclusive_group()
+    restore.add_argument('--resume', type=Path)
+    restore.add_argument('--initial-checkpoint', type=Path, help='Complete preceding epoch; retain model and optimizer, begin a new shuffled epoch')
+    p.add_argument('--epoch-index', type=int, default=0, help='Zero-based cumulative epoch index, used for sample order and RNG')
+    p.add_argument('--checkpoint-dir', type=Path, help='Optional shared directory for atomic resume_latest.pt across epoch runs')
+    p.add_argument('--export-final', action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument('--full-validation-at-end', action=argparse.BooleanOptionalAction, default=True)
     p.add_argument('--stop-after-updates', type=int, default=0, help='Save a resumable checkpoint at this absolute update; 0 completes the epoch')
     args = p.parse_args()
     if min(args.global_batch, args.cpu_threads, args.benchmark_updates, args.log_updates, args.val_windows) < 1:
         p.error('Batch, thread, benchmark, logging and validation sizes must be positive')
-    if min(args.workers, args.warmup_updates, args.val_updates, args.checkpoint_updates, args.stop_after_updates) < 0:
+    if min(args.workers, args.warmup_updates, args.val_updates, args.checkpoint_updates, args.stop_after_updates, args.epoch_index) < 0:
         p.error('Counts cannot be negative')
     if not 0 <= args.static_probability <= 1: p.error('static-probability must be in [0,1]')
+    if args.initial_checkpoint and args.epoch_index == 0:
+        p.error('--initial-checkpoint requires --epoch-index >= 1')
     return args
 
 

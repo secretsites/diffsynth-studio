@@ -43,7 +43,7 @@ def main(args):
         if proc.exists() and b'tensorboard_orca_live.py' in proc.read_bytes():
             raise RuntimeError('A TensorBoard bridge is already running for this run')
     # Rebuild the complete event history from authoritative JSONL on bridge restart.
-    writer = SummaryWriter(str(logdir), purge_step=0, flush_secs=5)
+    writer = SummaryWriter(str(logdir), purge_step=args.step_offset + 1 if args.step_offset else 0, flush_secs=5)
     writer.add_text('Run/configuration', '\n\n'.join([
         f"**Base model:** {config['model']}", f"**Dataset:** {config['dataset']}",
         f"**GPUs:** {config['world_size']}; **global batch:** {config['global_batch']}",
@@ -51,7 +51,7 @@ def main(args):
         f"**Validation:** fixed windows at initialization and every {config['val_updates']} updates; full validation at the end.",
         '**Time axes:** steps are optimizer updates. Event wall time is ingestion time; Performance/update_seconds is measured training time.',
         '**Memory:** GPU0 allocator peak, excluding driver/display allocations.'
-    ]), 0)
+    ]), args.step_offset)
     train_seen = {}
     validation_seen = {}
     final_step = math.ceil(config['train_windows'] / config['global_batch'])
@@ -61,7 +61,7 @@ def main(args):
         canonical = {row['optimizer_updates']: row for row in read_complete_rows(run / 'metrics.jsonl')}
         records = [canonical[step] for step in sorted(canonical)]
         for position, row in enumerate(records):
-            step = row['optimizer_updates']
+            step = args.step_offset + row['optimizer_updates']
             encoded = json.dumps(row, sort_keys=True)
             if train_seen.get(step) == encoded:
                 continue
@@ -73,7 +73,9 @@ def main(args):
                 'Performance/windows_per_second': row['global_windows_per_second'],
                 'Performance/windows_per_second_20_updates': rolling_windows / sum(v['update_seconds'] for v in rolling),
                 'Progress/epoch_fraction': row['epoch_fraction'],
-                'Progress/completed_windows': row['completed_windows'],
+                'Progress/epochs_completed': args.step_offset / final_step + row['epoch_fraction'],
+                'Progress/cumulative_epochs_completed': config.get('cumulative_epoch', 1) - 1 + row['epoch_fraction'],
+                'Progress/completed_windows': args.step_offset // final_step * config['train_windows'] + row['completed_windows'],
                 'GPU0/peak_allocated_GiB': row['peak_allocated_gib'],
                 'GPU0/peak_reserved_GiB': row['peak_reserved_gib'],
                 'Train/learning_rate': config['learning_rate'],
@@ -87,7 +89,7 @@ def main(args):
             if validation_seen.get(phase) == encoded:
                 continue
             tag = 'Loss/validation_full' if phase == 'final_full' else 'Loss/validation_fixed'
-            writer.add_scalar(tag, row['loss'], validation_step(phase, final_step))
+            writer.add_scalar(tag, row['loss'], args.step_offset + validation_step(phase, final_step))
             validation_seen[phase] = encoded
         writer.flush()
         job = json.loads((run / 'job_status.json').read_text())
@@ -110,7 +112,10 @@ if __name__ == '__main__':
     parser.add_argument('--logdir', type=Path)
     parser.add_argument('--interval', type=float, default=5)
     parser.add_argument('--once', action='store_true')
+    parser.add_argument('--step-offset', type=int, default=0, help='Prior updates in the same multi-epoch experiment')
     args = parser.parse_args()
     if args.interval <= 0:
         parser.error('interval must be positive')
+    if args.step_offset < 0:
+        parser.error('step-offset must be nonnegative')
     main(args)

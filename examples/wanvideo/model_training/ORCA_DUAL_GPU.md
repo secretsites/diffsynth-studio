@@ -71,3 +71,21 @@ tensorboard --logdir /path/to/run/tensorboard --host 127.0.0.1 --port 6006 --rel
 访问 `http://127.0.0.1:6006/#scalars`。主要标签为 `Loss/train`、`Loss/validation_fixed`、`Loss/validation_full`、`Performance/update_seconds`、`Performance/windows_per_second_20_updates`、`Progress/epoch_fraction`。GPU0显存标签记录PyTorch allocator峰值，未包含驱动或桌面显存。
 
 同步程序先导入已有历史，再每5秒跟进新记录，训练终止后完成最后一次刷新并退出。横轴step是优化器更新数；事件wall time是日志导入时间，实际每步耗时看Performance标签。训练loss随窗口与扩散时刻变化，收敛比较优先使用固定验证清单。
+
+## 从完整一轮继续训练多轮
+
+以下命令等待第一轮训练成功完成并检查权重，然后保留全部 DiT 和 AdamW 状态，再训练 7 轮。第 6、7 个追加轮次分别是累计第 7、8 轮：
+
+```bash
+python examples/wanvideo/model_training/continue_orca_delta_epochs.py \
+  --parent-run /path/to/completed-or-running/epoch1 \
+  --output /path/to/new/continuation7 --epochs 7 --save-epochs 6 7
+```
+
+- 每轮完整遍历全部窗口；顺序、扩散噪声和静态增强随机数由累计 epoch 与样本 ID 决定，逐轮更新。固定验证噪声不变。
+- 各轮单独记录源码、样本顺序、实际覆盖和验证结果。每轮重新加载前轮的全部模型与优化器状态，因此优化器步数持续累加；学习率保持不变。
+- 追加 7 轮共 436,996 个窗口、3,416 次参数更新。每 100 次更新继续保存一个原子替换的 `resume_latest.pt`；固定验证也保持每 100 步及每轮结束。全 6,666 窗口验证在最后一轮结束时执行。
+- 第 6、7 个追加轮次保留完整权重 `continuation-epoch-6-total-7.safetensors` 和 `continuation-epoch-7-total-8.safetensors`。这些文件是各轮导出的硬链接，不额外复制权重；原始第一轮权重保留。
+- 同一输出目录可重启 supervisor。它跳过已审计完成的轮次，恢复当前轮最近检查点；若当前轮还没有检查点，则保留不完整尝试并从上一完整轮开始。
+- `tensorboard/` 包含全部追加轮次的连续曲线，横轴为本次追加训练的参数更新（1–3,416）；`Progress/epochs_completed` 表示追加轮数，`Progress/cumulative_epochs_completed` 表示累计轮数。
+- `--initial-checkpoint` 用于加载前一完整轮的模型及优化器并开始下一轮；`--resume` 用于恢复同一轮，两者互斥。较小的单轮进程也便于逐轮核验，但会产生每轮加载权重的额外耗时。
