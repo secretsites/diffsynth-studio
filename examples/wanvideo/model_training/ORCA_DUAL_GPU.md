@@ -58,3 +58,16 @@ benchmark会进行真实前向、反向和AdamW更新，但不会保存或将测
 - 优化器保持现有BF16参数对应的状态精度，没有改成LoRA、8-bit优化器或FP8训练。
 - 较大的全局batch意味着每轮更新次数较少；一次完整数据遍历不保证模型已经学会动作控制，生成质量须单独验证。
 - 现有原生入口的梯度累积清零顺序也已修复；双卡完整遍历使用本文件入口，不受旧入口的每轮501batch限制。
+
+## TensorBoard 实时曲线
+
+已经运行的训练无需重启，可以将 JSONL 记录同步到 TensorBoard：
+
+```bash
+CUDA_VISIBLE_DEVICES='' python examples/wanvideo/model_training/tensorboard_orca_live.py --run /path/to/run
+tensorboard --logdir /path/to/run/tensorboard --host 127.0.0.1 --port 6006 --reload_interval 5
+```
+
+访问 `http://127.0.0.1:6006/#scalars`。主要标签为 `Loss/train`、`Loss/validation_fixed`、`Loss/validation_full`、`Performance/update_seconds`、`Performance/windows_per_second_20_updates`、`Progress/epoch_fraction`。GPU0显存标签记录PyTorch allocator峰值，未包含驱动或桌面显存。
+
+同步程序先导入已有历史，再每5秒跟进新记录，训练终止后完成最后一次刷新并退出。横轴step是优化器更新数；事件wall time是日志导入时间，实际每步耗时看Performance标签。训练loss随窗口与扩散时刻变化，收敛比较优先使用固定验证清单。
