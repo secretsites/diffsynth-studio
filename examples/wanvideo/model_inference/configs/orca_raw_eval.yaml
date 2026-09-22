@@ -1,0 +1,30 @@
+version: 1
+output: outputs/orca_raw_delta_eval
+devices: [0, 1]
+cpu_threads: 4
+model:
+  base_path: /home/yiwei/workspace/model/Wan2.2-TI2V-5B
+  checkpoint: /home/yiwei/workspace/wm-test/checkpoints/orca-delta-full-dataset/epoch-8.safetensors
+  checkpoint_sha256: null
+dataset:
+  format: lerobot
+  path: /home/yiwei/workspace/datasets/orca-template1-dev
+  action_dim: 58
+  action_mode: delta        # Must match checkpoint semantics; use newly trained weights for abs/relative.
+  camera_key: observation.images.cam_left_high
+  cache_dir: outputs/.cache/orca_online
+  validation_episodes: [12, 13, 29, 61, 77, 90, 100, 106, 108, 109, 114, 121, 140, 142, 144]
+  normalization: quantile
+  scale_quantile: 0.99
+  action_stats: null
+rollout:
+  episode: val_data/orca/episode_000144
+  start_frame: 0
+  frames: 440
+  modes: [tf]
+  actions: [real, zero]
+sampling:
+  steps: 50
+  sigma_shift: 5.0
+  seed: 12345
+  seed_stride: 100000

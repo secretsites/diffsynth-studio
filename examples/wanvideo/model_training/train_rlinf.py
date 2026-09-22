@@ -4,10 +4,13 @@ from pathlib import Path
 # Resolve this checkout even if another DiffSynth repository is installed editable.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-import torch, os, json, ast
+import ast
+import json
+import os
+import random
+
+import torch
 import numpy as np
-from PIL import Image
-from diffsynth import load_state_dict
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task, wan_parser
 from diffsynth.trainers.utils import RLinfDataset
@@ -30,15 +33,6 @@ def dataset_options(args):
                 max_finish_step=args.max_finish_step,
                 retain_actions=args.retain_actions, action2obs_bias=args.action2obs_bias)
 
-# --- Patch Start: 允许加载包含 set 的权重文件 ---
-try:
-    torch.serialization.add_safe_globals(['set', 'OrderedDict', 'builtins.set'])
-except AttributeError:
-    pass
-# --- Patch End ---
-
-
-
 class WanTrainingModule(DiffusionTrainingModule):
     def __init__(
         self,
@@ -50,7 +44,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         extra_inputs=None,
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
-        static_video_prob=0.0, # 新增参数
+        static_video_prob=0.0,
         action_dim=7,
     ):
         super().__init__()
@@ -80,33 +74,25 @@ class WanTrainingModule(DiffusionTrainingModule):
         self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
-        self.static_video_prob = static_video_prob # 保存参数
+        self.static_video_prob = static_video_prob
         
         
     def forward_preprocess(self, data):
-        # === 新增：静态样本增强 ===
-        # 如果启用，随机将当前样本变为“完全静止”，强迫模型学习背景保持
+        # Static abs samples hold the reference pose; delta/relative samples use zero.
         if self.training and self.static_video_prob > 0 and np.random.rand() < self.static_video_prob:
             first_frame = data["video"][0]
             data["video"] = [first_frame] * len(data["video"])
             if "action" in data:
-                data["action"] = torch.zeros_like(data["action"])
-        # ============================
-        # CFG-sensitive parameters
-        # inputs_posi = {"prompt": data["prompt"]}
+                data["action"] = data["static_action"].clone() if "static_action" in data else torch.zeros_like(data["action"])
         inputs_posi = {}
         inputs_nega = {}
         
         # CFG-unsensitive parameters
         inputs_shared = {
-            # Assume you are using this pipeline for inference,
-            # please fill in the input parameters.
             "input_video": data["video"],
             "height": data["video"][0].size[1],
             "width": data["video"][0].size[0],
             "num_frames": len(data["video"]),
-            # Please do not modify the following parameters
-            # unless you clearly know what this will cause.
             "cfg_scale": 1,
             "tiled": False,
             "rand_device": self.pipe.device,
@@ -120,7 +106,6 @@ class WanTrainingModule(DiffusionTrainingModule):
         }
         
         # Extra inputs
-        # print(f'====WanTrainingModule forward_preprocess extra_inputs: {self.extra_inputs}====')
         # control_video, reference_image, etc.
         for extra_input in self.extra_inputs:
             if extra_input == "input_image":
@@ -138,7 +123,34 @@ class WanTrainingModule(DiffusionTrainingModule):
         return {**inputs_shared, **inputs_posi}
     
     
-    def forward(self, data, inputs=None):
+    def forward_batch(self, samples, sample_seeds):
+        """Encode windows independently, then run a real batched DiT forward/backward.
+
+        Seeds preserve augmentation/noise/timestep for each window when the batch
+        size changes. VAE encoding retains the original causal window boundaries.
+        """
+        if not samples or sample_seeds is None or len(samples) != len(sample_seeds):
+            raise ValueError('Each batched training sample requires its own seed')
+        prepared, targets, timesteps, weights = [], [], [], []
+        for data, seed in zip(samples, sample_seeds):
+            random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+            if torch.cuda.is_available(): torch.cuda.manual_seed(seed)
+            inputs = self.forward_preprocess(data)
+            inputs, target, timestep, weight = self.pipe.prepare_training_loss_inputs(inputs)
+            prepared.append(inputs); targets.append(target); timesteps.append(timestep); weights.append(weight)
+        combined = dict(prepared[0])
+        for name in ['latents', 'input_latents', 'noise', 'first_frame_latents']:
+            if name in combined:
+                combined[name] = torch.cat([item[name] for item in prepared], dim=0)
+        combined['action'] = torch.stack([item['action'] for item in prepared])
+        models = {name: getattr(self.pipe, name) for name in self.pipe.in_iteration_models}
+        prediction = self.pipe.model_fn(**models, **combined, timestep=torch.cat(timesteps))
+        return self.pipe.training_loss_from_prediction(prediction, torch.cat(targets),
+                                                       torch.stack(weights), reduction='none')
+
+    def forward(self, data, inputs=None, sample_seeds=None):
+        if isinstance(data, list):
+            return self.forward_batch(data, sample_seeds)
         if inputs is None: inputs = self.forward_preprocess(data)
         models = {name: getattr(self.pipe, name) for name in self.pipe.in_iteration_models}
         loss = self.pipe.training_loss(**models, **inputs)
@@ -147,7 +159,7 @@ class WanTrainingModule(DiffusionTrainingModule):
 
 if __name__ == "__main__":
     parser = wan_parser()
-    parser.add_argument("--static_video_prob", type=float, default=0.15, help="Probability of replacing the sample with a static video (action=0)")
+    parser.add_argument("--static_video_prob", type=float, default=0.15, help="Probability of replacing a sample with a static video and matching hold action")
     parser.add_argument("--val_interval", type=int, default=5, help="Validation interval in epochs")
     parser.add_argument("--dataset",type=str,default="RLinfNpyDataset",help="Dataset type for training")
     parser.add_argument("--action_dim", type=int, default=7, help="Action dimension for dataset and hash-based WanModel config override.")
@@ -216,7 +228,6 @@ if __name__ == "__main__":
         )
     else:
         raise NotImplementedError('this dataset type not implemented')
-    # ----------------------
     model = WanTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,

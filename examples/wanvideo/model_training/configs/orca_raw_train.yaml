@@ -1,0 +1,46 @@
+# Shared template for abs/delta/relative and full/LoRA training.
+# Set paths/devices here, or override fields with train.py --set key=value.
+version: 1
+output: outputs/orca_raw_delta_train
+devices: [0, 1]
+model:
+  base_path: /home/yiwei/workspace/model/Wan2.2-TI2V-5B
+dataset:
+  format: lerobot
+  path: /home/yiwei/workspace/datasets/orca-template1-dev
+  action_dim: 58
+  action_mode: delta        # abs | delta | relative
+  camera_key: observation.images.cam_left_high
+  cache_dir: outputs/.cache/orca_online
+  validation_episodes: [12, 13, 29, 61, 77, 90, 100, 106, 108, 109, 114, 121, 140, 142, 144]
+  normalization: quantile  # quantile | none (physical units)
+  scale_quantile: 0.99
+  action_stats: null       # null = fit TRAIN episodes automatically; optional compatible stats JSON
+training:
+  mode: full              # full | lora
+  epochs: 1
+  global_batch: 128
+  micro_batch_size: 1      # Real batch per GPU; tune to GPU memory before increasing.
+  learning_rate: 1.0e-5
+  weight_decay: 0.01
+  static_probability: 0.15
+  gradient_checkpointing: false
+  fused_adamw: true
+  workers: 2
+lora:
+  rank: 32
+  target_modules: [q, k, v, o, ffn.0, ffn.2]
+initialization:
+  mode: base              # base | continue (next epoch) | resume (interrupted epoch)
+  checkpoint: null        # resume_latest.pt includes model + optimizer
+  completed_epochs: 0
+checkpoint:
+  every_updates: 100
+  save_epochs: null
+validation:
+  every_updates: 100
+  windows: 120
+  full_at_end: true
+logging:
+  every_updates: 10
+  tensorboard: true

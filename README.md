@@ -2,9 +2,22 @@
 
 This repository is a Wan2.2-TI2V-5B world-model training/inference fork based on DiffSynth-Studio.
 
-## Training Entry
+## ORCA H2 + Sharpa Training
 
-Main training entry:
+Use [train.py](examples/wanvideo/model_training/train.py) with the [shared training config](examples/wanvideo/model_training/configs/orca_raw_train.yaml) for full-parameter or LoRA training in all three action spaces. The same entrypoint supports multiple GPUs, real microbatches, optimizer-preserving resume and TensorBoard. See the [training guide](examples/wanvideo/model_training/README_ORCA.md) for continuous training and checkpoint retention, and the [evaluation guide](examples/wanvideo/model_inference/README_ORCA.md) for TF/AR rollouts.
+
+For original LeRobot data without a conversion step, use [orca_raw_train.yaml](examples/wanvideo/model_training/configs/orca_raw_train.yaml) / [orca_raw_eval.yaml](examples/wanvideo/model_inference/configs/orca_raw_eval.yaml). Set `dataset.format: lerobot` and `dataset.action_mode: abs | delta | relative`. Here delta = target minus simultaneous measured state; relative = target minus the prediction-window start measured state. Training and evaluation share the loader and training-only normalization. Static augmentation follows the selected action semantics. Existing prepared delta NPY configs remain supported.
+
+```bash
+python examples/wanvideo/model_training/train.py \
+  --config examples/wanvideo/model_training/configs/orca_raw_train.yaml \
+  --set dataset.action_mode=relative \
+  --set output=outputs/orca_relative_train
+```
+
+## Other RLinf Datasets
+
+The native entrypoint for simulation and other real-world RLinf datasets remains:
 
 ```bash
 python examples/wanvideo/model_training/train_rlinf.py ...

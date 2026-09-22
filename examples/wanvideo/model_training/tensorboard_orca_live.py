@@ -47,7 +47,7 @@ def main(args):
     writer.add_text('Run/configuration', '\n\n'.join([
         f"**Base model:** {config['model']}", f"**Dataset:** {config['dataset']}",
         f"**GPUs:** {config['world_size']}; **global batch:** {config['global_batch']}",
-        f"**Training:** full DiT; VAE frozen; 58D delta; static augmentation {config['static_probability']:.0%}.",
+        f"**Training:** {config.get('training_mode', 'full')} DiT; VAE frozen; 58D {config.get('action_mode', 'delta')}; static augmentation {config['static_probability']:.0%}.",
         f"**Validation:** fixed windows at initialization and every {config['val_updates']} updates; full validation at the end.",
         '**Time axes:** steps are optimizer updates. Event wall time is ingestion time; Performance/update_seconds is measured training time.',
         '**Memory:** GPU0 allocator peak, excluding driver/display allocations.'
@@ -80,6 +80,9 @@ def main(args):
                 'GPU0/peak_reserved_GiB': row['peak_reserved_gib'],
                 'Train/learning_rate': config['learning_rate'],
             }
+            if 'micro_batch_size' in row:
+                values['Train/micro_batch_per_gpu'] = row['micro_batch_size']
+                values['Train/gradient_accumulation'] = row['accumulation_per_rank']
             for tag, value in values.items():
                 writer.add_scalar(tag, value, step)
             train_seen[step] = encoded
@@ -99,7 +102,7 @@ def main(args):
         temp = status_path.with_suffix('.json.tmp')
         temp.write_text(json.dumps(status, indent=2) + '\n')
         temp.replace(status_path)
-        if args.once or job['status'] in {'completed', 'failed'}:
+        if args.once or job['status'] in {'completed', 'failed', 'stopped'}:
             print(json.dumps(status), flush=True)
             break
         time.sleep(args.interval)

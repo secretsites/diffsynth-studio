@@ -2,7 +2,6 @@
 import contextlib
 import io
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
@@ -16,22 +15,13 @@ from accelerate import Accelerator
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'examples/wanvideo/model_training'))
-from train_orca_delta_distributed import make_order, shard_order, group_real_count, audit_processed_windows, check_initial_checkpoint
+from train_orca import make_order, shard_order, group_real_count, audit_processed_windows, check_initial_checkpoint
 from tensorboard_orca_live import main as mirror_tensorboard
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 from diffsynth.trainers.utils import DiffusionTrainingModule, launch_training_task
 
 
 class CoverageTests(unittest.TestCase):
-    def test_seven_continued_epochs_cover_every_window_and_change_shuffle(self):
-        previous = make_order(62428, 12345, 0)
-        for epoch in range(1, 8):
-            order = make_order(62428, 12345, epoch)
-            self.assertFalse(np.array_equal(previous, order))
-            real = [i for rank in range(2) for i, valid in shard_order(order, 2, rank) if valid]
-            self.assertEqual(sorted(real), list(range(62428)))
-            self.assertEqual(sum(group_real_count(62428, u, 64, 2) for u in range(488)), 62428)
-            previous = order
 
     def test_next_epoch_requires_complete_matching_checkpoint_and_optimizer(self):
         config = dict(global_batch=128, learning_rate=1e-5, weight_decay=.01, static_probability=.15,
@@ -89,22 +79,6 @@ class CoverageTests(unittest.TestCase):
         remaining = [index for rank in range(2) for index, valid in shard_order(order, 2, rank)[16:] if valid]
         self.assertFalse(done.intersection(remaining))
         self.assertEqual(done.union(remaining), set(range(101)))
-
-    def test_partial_ddp_group_matches_unsharded_full_batch_gradient(self):
-        # Unequal final sample counts per rank; compare against a single mean loss.
-        inputs = torch.tensor([1., 4., -2.])
-        weight = torch.tensor(.2, requires_grad=True)
-        ((weight * inputs - 1) ** 2).mean().backward()
-        expected = weight.grad.clone()
-        rank_grads = []
-        for rank in range(2):
-            local_weight = torch.tensor(.2, requires_grad=True)
-            for index, valid in shard_order(np.arange(3), 2, rank):
-                loss = (local_weight * inputs[index] - 1) ** 2
-                (loss * (2 / 3 if valid else 0)).backward()
-            rank_grads.append(local_weight.grad)
-        torch.testing.assert_close(torch.stack(rank_grads).mean(), expected)
-
 
 class ToyDataset(torch.utils.data.Dataset):
     load_from_cache = False

@@ -113,7 +113,9 @@ class WanVideoPipeline(BasePipeline):
             loader = GeneralLoRALoader(torch_dtype=self.torch_dtype, device=self.device)
             loader.load(module, lora, alpha=alpha)
         
-    def training_loss(self, **inputs):
+    def prepare_training_loss_inputs(self, inputs):
+        """Prepare one independently sampled training example before DiT batching."""
+        inputs = dict(inputs)
         # print(f'====WanVideoPipeline training_loss')
         max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * self.scheduler.num_train_timesteps)
         min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * self.scheduler.num_train_timesteps)
@@ -156,7 +158,9 @@ class WanVideoPipeline(BasePipeline):
             ("training_target", training_target),
         ]:
             assert torch.isfinite(t).all(), f"{name} has NaN/Inf, min={t.min()}, max={t.max()}"
-        noise_pred = self.model_fn(**inputs, timestep=timestep)
+        return inputs, training_target, timestep, self.scheduler.training_weight(timestep)
+
+    def training_loss_from_prediction(self, noise_pred, training_target, weight, reduction='mean'):
         assert torch.isfinite(noise_pred).all(), f"noise_pred has NaN/Inf, min={noise_pred.min()}, max={noise_pred.max()}"
 
         if self.dit.has_action_mode:
@@ -165,13 +169,18 @@ class WanVideoPipeline(BasePipeline):
             mask = torch.zeros_like(loss)
             mask[:, :, -2:] = 1.0
             
-            loss = (loss * mask).sum() / mask.sum()
+            loss = (loss * mask).flatten(1).sum(1) / mask.flatten(1).sum(1)
         else:
-            loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+            loss = (noise_pred.float() - training_target.float()).square().flatten(1).mean(1)
         # ========================================================
 
-        loss = loss * self.scheduler.training_weight(timestep)
-        return loss
+        loss = loss * weight.to(device=loss.device)
+        return loss if reduction == 'none' else loss.mean()
+
+    def training_loss(self, **inputs):
+        inputs, target, timestep, weight = self.prepare_training_loss_inputs(inputs)
+        noise_pred = self.model_fn(**inputs, timestep=timestep)
+        return self.training_loss_from_prediction(noise_pred, target, weight)
 
     
     def enable_vram_management(self, num_persistent_param_in_dit=None, vram_limit=None, vram_buffer=0.5):
@@ -1678,7 +1687,19 @@ def model_fn_wan_video(
         )
         spatial_expand = (latents.shape[3] // patch_h) * (latents.shape[4] // patch_w)
 
-        if not bs_1:
+        if not bs_1 and timestep.numel() == latents.shape[0] and latents.shape[0] > 1:
+            # Each training example keeps its own diffusion timestep. Conditioning
+            # tokens remain at timestep zero, exactly as in the single-example path.
+            token_times = timestep.reshape(-1, 1, 1).expand(-1, latents.shape[2], spatial_expand).clone()
+            token_times[:, :2] = 0
+            token_times = token_times.flatten(1)
+            embedding = sinusoidal_embedding_1d(dit.freq_dim, token_times.flatten())
+            t = dit.time_embedding(embedding).reshape(latents.shape[0], -1, dit.dim)
+            if dit.enable_action_modulation:
+                action_emb = action_emb.unsqueeze(2).expand(-1, -1, spatial_expand, -1).flatten(1, 2)
+                t = t + action_emb
+            t_mod = dit.time_projection(t).unflatten(2, (6, dit.dim))
+        elif not bs_1:
             timestep = torch.concat([
                 torch.zeros((2, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device),
                 torch.ones((latents.shape[2] - 2, latents.shape[3] * latents.shape[4] // 4), dtype=latents.dtype, device=latents.device) * timestep

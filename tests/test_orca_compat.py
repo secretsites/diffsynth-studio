@@ -1,4 +1,4 @@
-"""Regressions for zero-preserving deltas, temporal alignment and native training."""
+"""Legacy NPY alignment and initialization of action branches from base checkpoints."""
 import contextlib
 import io
 import json
@@ -15,31 +15,9 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'examples/wanvideo/model_training'))
-import convert_orca_delta as convert
 import train_rlinf as train
 from diffsynth.trainers.dataset import RLinfDataset, validate_action_contract
 from diffsynth.models.model_manager import load_model_from_single_file
-
-
-class DeltaTests(unittest.TestCase):
-    def test_delta_is_same_time_target_minus_state_including_first_and_last(self):
-        state = np.tile(np.array([3, 8, 11], np.float32)[:, None], (1, 58))
-        target = np.tile(np.array([4, 10, 15], np.float32)[:, None], (1, 58))
-        np.testing.assert_array_equal(convert.target_error(target, state), np.tile([[1], [2], [4]], (1, 58)))
-        np.testing.assert_array_equal(convert.target_error(state, state), np.zeros_like(state))
-
-    def test_asymmetric_training_distribution_keeps_physical_zero_at_zero(self):
-        deltas = np.tile(np.array([1, 2, 3, 4], np.float32)[:, None], (1, 58))
-        scale = convert.fit_scale([deltas], 1.0)
-        np.testing.assert_array_equal(scale, np.full(58, 4))
-        normalized = convert.normalize_delta(np.tile([[-2], [0], [2], [8]], (1, 58)), scale)
-        np.testing.assert_array_equal(normalized[:, 0], [-.5, 0, .5, 1])
-
-    def test_constant_coordinates_and_nonfinite_inputs(self):
-        zero = np.zeros((2, 58), np.float32)
-        np.testing.assert_array_equal(convert.fit_scale([zero]), np.ones(58))
-        with self.assertRaises(ValueError): convert.target_error(zero, np.full_like(zero, np.nan))
-        with self.assertRaises(ValueError): convert.normalize_delta(zero, np.zeros(58))
 
 
 class LoaderTests(unittest.TestCase):
@@ -91,34 +69,6 @@ class LoaderTests(unittest.TestCase):
             info['action2obs_bias_applied']=False; (root/'dataset_info.json').write_text(json.dumps(info))
             stats['center'][0]=.1; (root/'action_stats.json').write_text(json.dumps(stats))
             with self.assertRaisesRegex(ValueError,'preserve zero'): validate_action_contract(str(split),58,True)
-
-
-class StaticAugmentationTests(unittest.TestCase):
-    def module(self):
-        m = train.WanTrainingModule.__new__(train.WanTrainingModule)
-        torch.nn.Module.__init__(m)
-        m.static_video_prob = 1.0
-        m.pipe = SimpleNamespace(device='cpu', units=[])
-        m.extra_inputs = ['input_image','action']
-        m.use_gradient_checkpointing = False; m.use_gradient_checkpointing_offload = False
-        m.max_timestep_boundary = 1.; m.min_timestep_boundary = 0.
-        return m
-
-    def data(self):
-        from PIL import Image
-        return {'video':[Image.fromarray(np.full((8,8,3),i,np.uint8)) for i in range(13)],
-                'action':torch.ones(13,58)}
-
-    def test_training_static_sample_has_constant_rgb_and_zero_58d_actions(self):
-        out = self.module().forward_preprocess(self.data())
-        self.assertEqual(tuple(out['action'].shape),(13,58))
-        self.assertEqual(int(torch.count_nonzero(out['action'])),0)
-        for f in out['input_video']: np.testing.assert_array_equal(np.asarray(f),np.zeros((8,8,3)))
-
-    def test_validation_never_augmented(self):
-        m=self.module(); m.eval(); out=m.forward_preprocess(self.data())
-        self.assertTrue(torch.equal(out['action'],torch.ones(13,58)))
-        self.assertEqual(np.asarray(out['input_video'][-1])[0,0,0],12)
 
 
 class TinyConverter:

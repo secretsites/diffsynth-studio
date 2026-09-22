@@ -1,0 +1,11 @@
+# Follows the already-running experiment without interrupting its current epoch.
+# This policy is read by continue_orca_training.py, not by train.py.
+version: 1
+run: outputs/orca_raw_relative_full_epoch1
+enabled: true
+save_every_epochs: 2
+# Approved rolling retention: only this run's older exports may be pruned.
+keep_last_exports: 2
+full_validation_every_epochs: 2
+reserve_gib: 4
+poll_seconds: 15
